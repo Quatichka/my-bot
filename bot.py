@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw
 from telegram import (
     BotCommand,
+    BotCommandScopeChat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
@@ -83,6 +84,8 @@ def load_db() -> dict:
 
 
 DB = load_db()
+DB.setdefault("closed_days", [])   # дни, закрытые мастером целиком
+DB.setdefault("closed_slots", {})  # {"2026-10-01": ["10:00", ...]} — окна, закрытые мастером
 
 
 def save_db() -> None:
@@ -96,31 +99,38 @@ def now() -> datetime:
     return datetime.now(TZ)
 
 
-def is_busy(day: str, slot: str) -> bool:
-    return any(
-        b["date"] == day and b["time"] == slot and b["status"] in ACTIVE
-        for b in DB["bookings"].values()
+def booking_at(day: str, slot: str) -> dict | None:
+    return next(
+        (b for b in DB["bookings"].values() if b["date"] == day and b["time"] == slot and b["status"] in ACTIVE),
+        None,
     )
 
 
+def is_closed(day: str, slot: str) -> bool:
+    return day in DB["closed_days"] or slot in DB["closed_slots"].get(day, [])
+
+
+def is_busy(day: str, slot: str) -> bool:
+    return is_closed(day, slot) or booking_at(day, slot) is not None
+
+
+def is_past(day: date, slot: str) -> bool:
+    h, m = map(int, slot.split(":"))
+    return datetime.combine(day, time(h, m), TZ) < now() + MIN_LEAD
+
+
 def free_slots(day: date) -> list[str]:
-    result = []
-    for slot in SLOTS:
-        h, m = map(int, slot.split(":"))
-        start = datetime.combine(day, time(h, m), TZ)
-        if start >= now() + MIN_LEAD and not is_busy(day.isoformat(), slot):
-            result.append(slot)
-    return result
+    return [s for s in SLOTS if not is_past(day, s) and not is_busy(day.isoformat(), s)]
 
 
-def open_days() -> list[date]:
+def open_days(count: int = DAYS_AHEAD) -> list[date]:
     today = now().date()
     days = []
-    for i in range(DAYS_AHEAD * 2):
+    for i in range(count * 2):
         day = today + timedelta(days=i)
         if day.weekday() in WORK_DAYS:
             days.append(day)
-        if len(days) == DAYS_AHEAD:
+        if len(days) == count:
             break
     return days
 
@@ -273,6 +283,8 @@ async def screen_menu(update: Update) -> None:
         [Btn("💅 Услуги и цены", callback_data="services")],
         [Btn("📋 Мои записи", callback_data="my"), Btn("📍 Контакты", callback_data="contacts")],
     ]
+    if ADMIN_ID is not None and update.effective_user.id == ADMIN_ID:
+        rows.append([Btn("⚙️ Админ-панель", callback_data="adm")])
     await show(update, "welcome", caption, rows)
 
 
@@ -498,6 +510,111 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE, act
         log.error("Не удалось уведомить клиента: %s", e)
 
 
+# ───────────────────────── АДМИН-ПАНЕЛЬ ─────────────────────────
+
+ADMIN_DAYS_AHEAD = 14  # сколько рабочих дней видно в админке
+
+
+def is_admin(update: Update) -> bool:
+    return ADMIN_ID is not None and update.effective_user.id == ADMIN_ID
+
+
+async def admin_panel(update: Update) -> None:
+    buttons = []
+    for day in open_days(ADMIN_DAYS_AHEAD):
+        iso = day.isoformat()
+        if iso in DB["closed_days"]:
+            label = f"🚫 {fmt_day(iso)}"
+        else:
+            label = f"{fmt_day(iso)} · {len(free_slots(day))}/{len(SLOTS)}"
+        buttons.append(Btn(label, callback_data=f"admday:{iso}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    pending = sum(b["status"] == "pending" for b in DB["bookings"].values())
+    rows.append([Btn(f"📨 Необработанные заявки ({pending})", callback_data="admpending")])
+    rows.append(BACK_MENU)
+    caption = (
+        "<b>Админ-панель</b>\n\n"
+        "Выберите день, чтобы закрыть или открыть окна.\n"
+        "Цифры — свободно / всего, 🚫 — день закрыт."
+    )
+    await show(update, "calendar", caption, rows)
+
+
+async def admin_day(update: Update, iso: str) -> None:
+    day = date.fromisoformat(iso)
+    day_closed = iso in DB["closed_days"]
+    buttons = []
+    for slot in SLOTS:
+        if booking_at(iso, slot):
+            label = f"👤 {slot}"
+        elif is_closed(iso, slot):
+            label = f"🔒 {slot}"
+        elif is_past(day, slot):
+            label = f"· {slot}"
+        else:
+            label = f"🟢 {slot}"
+        buttons.append(Btn(label, callback_data=f"admslot:{iso}:{slot}"))
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([Btn("✅ Открыть весь день" if day_closed else "🚫 Закрыть весь день", callback_data=f"admclose:{iso}")])
+    rows.append([Btn("← Все дни", callback_data="adm")])
+
+    booked = sorted(
+        (b for b in DB["bookings"].values() if b["date"] == iso and b["status"] in ACTIVE),
+        key=lambda b: b["time"],
+    )
+    lines = [
+        f"{b['time']} — {html.escape(b['name'])}, {SERVICES[b['service']][0]} ({STATUS[b['status']]})"
+        for b in booked
+    ]
+    caption = f"<b>{fmt_day(iso)}</b>"
+    if day_closed:
+        caption += " — день закрыт 🚫"
+    caption += "\n\n🟢 свободно · 🔒 закрыто вами · 👤 запись\nНажмите на окно, чтобы закрыть или открыть его."
+    if lines:
+        caption += "\n\n<b>Записи:</b>\n" + "\n".join(lines)
+    await show(update, "calendar", caption, rows)
+
+
+def toggle_slot(iso: str, slot: str) -> str | None:
+    """Закрывает/открывает окно. Возвращает текст подсказки для мастера."""
+    b = booking_at(iso, slot)
+    if b:
+        return f"Здесь запись #{b['id']}: {b['name']}, {b['phone']}"
+    if iso in DB["closed_days"]:
+        return "Весь день закрыт — сначала откройте день."
+    slots = DB["closed_slots"].setdefault(iso, [])
+    if slot in slots:
+        slots.remove(slot)
+        toast = f"{slot} открыто"
+    else:
+        slots.append(slot)
+        toast = f"{slot} закрыто"
+    if not slots:
+        del DB["closed_slots"][iso]
+    save_db()
+    return toast
+
+
+def toggle_day(iso: str) -> str:
+    if iso in DB["closed_days"]:
+        DB["closed_days"].remove(iso)
+        toast = "День открыт"
+    else:
+        DB["closed_days"].append(iso)
+        toast = "День закрыт"
+        if any(booking_at(iso, s) for s in SLOTS):
+            toast += ". Внимание: на этот день уже есть записи!"
+    save_db()
+    return toast
+
+
+async def resend_pending(context: ContextTypes.DEFAULT_TYPE) -> int:
+    pending = [b for b in DB["bookings"].values() if b["status"] == "pending"]
+    for b in sorted(pending, key=lambda b: (b["date"], b["time"])):
+        await send_to_admin(context, b, resent=True)
+    return len(pending)
+
+
 # ───────────────────────── ОБРАБОТЧИКИ ─────────────────────────
 
 
@@ -516,14 +633,17 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/zayavki — мастер получает все необработанные заявки заново."""
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update):
         return
-    pending = [b for b in DB["bookings"].values() if b["status"] == "pending"]
-    if not pending:
+    if not await resend_pending(context):
         await update.message.reply_text("Необработанных заявок нет 👌")
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text("Админ-панель доступна только мастеру.")
         return
-    for b in sorted(pending, key=lambda b: (b["date"], b["time"])):
-        await send_to_admin(context, b, resent=True)
+    await admin_panel(update)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -535,7 +655,22 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     toast = None
-    if action == "menu":
+    if action.startswith("adm") and not is_admin(update):
+        toast = "Это кнопка для мастера."
+    elif action == "adm":
+        await admin_panel(update)
+    elif action == "admday":
+        await admin_day(update, args[0])
+    elif action == "admslot":
+        toast = toggle_slot(args[0], ":".join(args[1:]))
+        await admin_day(update, args[0])
+    elif action == "admclose":
+        toast = toggle_day(args[0])
+        await admin_day(update, args[0])
+    elif action == "admpending":
+        count = await resend_pending(context)
+        toast = f"Отправлено заявок: {count}" if count else "Необработанных заявок нет 👌"
+    elif action == "menu":
         await screen_menu(update)
     elif action == "services":
         await screen_services(update, booking=False)
@@ -619,7 +754,19 @@ async def post_init(app: Application) -> None:
         BotCommand("start", "Главное меню"),
         BotCommand("my", "Мои записи"),
     ])
-    if not ADMIN_ID:
+    if ADMIN_ID:
+        try:  # мастеру в меню команд дополнительно видны админские команды
+            await app.bot.set_my_commands(
+                [
+                    BotCommand("start", "Главное меню"),
+                    BotCommand("admin", "Админ-панель"),
+                    BotCommand("zayavki", "Необработанные заявки"),
+                ],
+                scope=BotCommandScopeChat(ADMIN_ID),
+            )
+        except TelegramError as e:
+            log.warning("Не удалось задать команды мастера: %s", e)
+    else:
         log.warning("ADMIN_ID не задан: заявки не будут приходить мастеру. Узнайте свой ID командой /myid.")
 
 
@@ -633,6 +780,7 @@ def main() -> None:
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("zayavki", cmd_pending))
+    app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.CONTACT | (filters.TEXT & ~filters.COMMAND), on_message))
 
